@@ -1,0 +1,2 @@
+[workspace]
+members = ["rushlink-core", "rushlink-cli", "rushlink-api"]
