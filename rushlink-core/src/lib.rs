@@ -18,9 +18,11 @@ pub struct LinkStore {
     database: DB,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     AlreadyExists,
+    DoesNotExist,
+    InvalidPassword,
     EncryptionFailed,
     DecryptionFailed,
     SerializationFailed,
@@ -40,11 +42,9 @@ struct LinkEntry {
 impl LinkStore {
     /// Open a Rocksdb dataset located at Path
     pub fn new(db_path: &str) -> Result<Self, String> {
-        let db = DB::open_default(db_path);
-        match db {
-            Ok(d) => Ok(LinkStore { database: d }),
-            Err(e) => Err(e.to_string()),
-        }
+        DB::open_default(db_path)
+            .map_err(|e| e.to_string())
+            .map(|database| Ok(LinkStore { database }))?
     }
 
     pub fn add_url(
@@ -54,7 +54,8 @@ impl LinkStore {
         password: &str,
         should_count_hits: bool,
     ) -> Result<(), Error> {
-        let (hasher, key) = self.hash_and_verify_unique_shortlink(shortlink)?;
+        let (hasher, key) = hash_shortlink(shortlink);
+        self.verify_unique_shortlink(&key)?;
 
         let (encrypted_destination, nonce) = encrypt_destination(shortlink, resolve_to, hasher)?;
 
@@ -71,32 +72,42 @@ impl LinkStore {
     }
 
     pub fn resolve_url(&self, shortlink: &str) -> Result<Option<(String, Option<u64>)>, Error> {
-        let mut hasher = Hasher::new();
-        hasher.update(shortlink.as_bytes());
-        let hash = hasher.finalize();
-        let key: &Hash = hash.as_bytes();
+        let (hasher, key) = hash_shortlink(shortlink);
+        self.database
+            .get(key)
+            .map_err(|_| Error::DatabaseReadFailed)?
+            .map(|v| {
+                self.resolve_from_entry(shortlink, &key, hasher, v)
+                    .map(|(r, e)| (r, e.hit_counter))
+            })
+            .map_or(Ok(None), |r| r.map(|v| Some(v)))
+    }
 
-        let query_result = self.database.get(key);
-        match query_result {
-            Err(_) => Err(Error::DatabaseReadFailed),
-            Ok(None) => Ok(None),
-            Ok(Some(v)) => self
-                .resolve_from_entry(shortlink, key, hasher, v)
-                .and_then(|(r, h)| Ok(Some((r, h)))),
-        }
+    pub fn delete_url(&self, shortlink: &str, password: &str) -> Result<(), Error> {
+        let (hasher, key) = hash_shortlink(shortlink);
+        self.database
+            .get(key)
+            .map_err(|_| Error::DatabaseReadFailed)?
+            .map_or(Err(Error::DoesNotExist), |v| {
+                self.resolve_from_entry(shortlink, &key, hasher, v)
+                    .and_then(|(_, entry)| {
+                        let password_hash = hash_password(password);
+                        if password_hash.eq(&entry.edit_password_hash) {
+                            self.database
+                                .delete(key)
+                                .map_err(|_| Error::DatabaseWriteFailed)
+                        } else {
+                            Err(Error::InvalidPassword)
+                        }
+                    })
+            })
     }
 
     fn write_to_db(&self, entry: &LinkEntry, key: &Hash) -> Result<(), Error> {
-        let encoding_result = serde_json::to_string(&entry);
-        if encoding_result.is_err() {
-            return Err(Error::SerializationFailed);
-        }
-        let encoded = encoding_result.unwrap();
-
-        match self.database.put(key, encoded) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(Error::DatabaseWriteFailed),
-        }
+        let encoded = serde_json::to_string(&entry).map_err(|_| Error::SerializationFailed)?;
+        self.database
+            .put(key, encoded)
+            .map_err(|_| Error::DatabaseWriteFailed)
     }
 
     fn resolve_from_entry(
@@ -105,14 +116,12 @@ impl LinkStore {
         key: &Hash,
         hasher: Hasher,
         serialized_entry: Vec<u8>,
-    ) -> Result<(String, Option<u64>), Error> {
-        let result: Result<LinkEntry, _> =
-            serde_json::from_str(std::str::from_utf8(&serialized_entry).unwrap());
-        if result.is_err() {
-            return Err(Error::SerializationFailed);
-        }
-        let mut entry = result.unwrap();
-
+    ) -> Result<(String, LinkEntry), Error> {
+        let mut entry = std::str::from_utf8(&serialized_entry)
+            .map_err(|_| Error::DeserializationFailed)
+            .map(|v| {
+                serde_json::from_str::<LinkEntry>(v).map_err(|_| Error::DeserializationFailed)
+            })??;
         let resolved = decrypt_destination(
             shortlink,
             &entry.encrypted_destination,
@@ -120,33 +129,32 @@ impl LinkStore {
             hasher,
         )?;
 
-        if entry.hit_counter.is_some() {
-            entry.hit_counter = entry.hit_counter.map(|count| count + 1);
+        if let Some(counter) = &mut entry.hit_counter {
+            *counter += 1;
             self.write_to_db(&entry, key)?;
         }
-        Ok((resolved, entry.hit_counter))
+
+        Ok((resolved, entry))
     }
 
-    fn hash_and_verify_unique_shortlink(&self, shortlink: &str) -> Result<(Hasher, Hash), Error> {
-        let mut hasher = Hasher::new();
-
-        hasher.update(shortlink.as_bytes());
-        let key = hasher.finalize().as_bytes().clone();
-
-        if self.database.get(key).is_err() {
-            return Err(Error::AlreadyExists);
-        }
-
-        match self.database.get(key) {
-            Err(_e) => Err(Error::DatabaseReadFailed),
-            Ok(Some(_v)) => Err(Error::AlreadyExists),
-            Ok(None) => Ok((hasher, key)),
-        }
+    fn verify_unique_shortlink(&self, key: &Hash) -> Result<(), Error> {
+        self.database
+            .get(key)
+            .map_err(|_| Error::AlreadyExists)
+            .and_then(|option| option.map_or(Ok(()), |_| Err(Error::AlreadyExists)))
     }
 }
 
 fn hash_password(password: &str) -> Hash {
-    blake3::hash(password.as_bytes()).as_bytes().clone()
+    *blake3::hash(password.as_bytes()).as_bytes()
+}
+
+fn hash_shortlink(shortlink: &str) -> (Hasher, Hash) {
+    let mut hasher = Hasher::new();
+    hasher.update(shortlink.as_bytes());
+    let hash = hasher.finalize();
+    let key: Hash = *hash.as_bytes();
+    (hasher, key)
 }
 
 fn encrypt_destination(
@@ -162,13 +170,10 @@ fn encrypt_destination(
     OsRng.fill_bytes(&mut nonce_buffer);
     let nonce = AesNonce::from_slice(&nonce_buffer);
 
-    let cipher = Aes256GcmSiv::new(GenericArray::from_slice(encryption_key));
-    let encryption_result = cipher.encrypt(GenericArray::from_slice(nonce), resolve_to.as_bytes());
-
-    match encryption_result {
-        Ok(v) => Ok((v, nonce_buffer)),
-        Err(_e) => Err(Error::EncryptionFailed),
-    }
+    Aes256GcmSiv::new(GenericArray::from_slice(encryption_key))
+        .encrypt(GenericArray::from_slice(nonce), resolve_to.as_bytes())
+        .map_err(|_| Error::EncryptionFailed)
+        .and_then(|v| Ok((v, nonce_buffer)))
 }
 
 fn decrypt_destination(
@@ -183,21 +188,19 @@ fn decrypt_destination(
 
     let nonce = AesNonce::from_slice(nonce);
 
-    let cipher = Aes256GcmSiv::new(GenericArray::from_slice(encryption_key));
-
-    let decryption_result = cipher.decrypt(AesNonce::from_slice(&nonce), ciphertext.as_ref());
-    match decryption_result {
-        Ok(v) => Ok(String::from_utf8(v).unwrap()),
-        Err(_) => Err(Error::DecryptionFailed),
-    }
+    Aes256GcmSiv::new(GenericArray::from_slice(encryption_key))
+        .decrypt(AesNonce::from_slice(nonce), ciphertext.as_ref())
+        .map_err(|_| Error::DecryptionFailed)
+        .and_then(|v| String::from_utf8(v).map_err(|_| Error::DeserializationFailed))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::LinkStore;
+    use super::*;
     use tempfile::{tempdir, TempDir};
 
     const SHORTLINK: &str = "link-this";
+    const INVALID_SHORT_LINK: &str = "does-not-exist";
     const DESTINATION_URL: &str = "https://example.com/destination";
     const PASSWORD: &str = "Password123";
 
@@ -242,6 +245,13 @@ mod tests {
         assert!(count.is_some());
         assert_eq!(count.unwrap(), 1);
 
+        let delete_result = store.delete_url(SHORTLINK, PASSWORD);
+        assert!(delete_result.is_ok());
+
+        let query_deleted_result = store.resolve_url(SHORTLINK);
+        assert!(query_deleted_result.is_ok());
+        assert!(query_deleted_result.unwrap().is_none());
+
         rm_temp_db(dir);
     }
 
@@ -253,6 +263,10 @@ mod tests {
         assert!(q.is_ok());
         let queried = q.unwrap();
         assert!(queried.is_none());
+
+        let q = store.delete_url(INVALID_SHORT_LINK, PASSWORD);
+        assert!(q.is_err());
+        assert_eq!(q.unwrap_err(), Error::DoesNotExist);
 
         rm_temp_db(dir);
     }
